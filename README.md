@@ -82,31 +82,27 @@ ndarray = { version = "0.16", features = ["rayon"] }
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
 
-# Random Forest — le crate le plus complet de l'écosystème Rust ML
-# Fournit DecisionTree, RandomForest, feature importances (MDI & permutation)
-smartcore = { version = "0.3", features = ["randomforest"] }
+# Decision tree — utilisé pour construire la Random Forest manuellement
+# (smartcore 0.3 n'expose pas de feature flag "randomforest" ; on construit
+#  notre propre forêt avec bootstrap + OOB à partir de DecisionTreeClassifier)
+smartcore = { version = "0.3", features = ["serde", "ndarray-bindings"] }
 
-# Alternative possible : linfa + linfa-trees
-# linfa       = "0.7"
-# linfa-trees = "0.7"
-
-# Génération de nombres aléatoires (shuffle des shadow features)
+# Génération de nombres aléatoires reproductible (bootstrap, shadow shuffle)
 rand       = "0.8"
-rand_distr = "0.4"   # distributions (Binomial, Normal, etc.)
+rand_chacha = "0.3"  # ChaCha8Rng — reproductible, rapide, seedable
+rand_distr = "0.4"   # distributions (Normal, etc.)
 
 # Statistiques : test binomial, correction Bonferroni
-# statrs fournit les distributions de probabilité nécessaires
 statrs = "0.16"
 
-# Parallélisation des itérations de la Random Forest
+# Parallélisation (entraînement des arbres + boucle de permutation)
 rayon = "1.10"
 
 # Logging
-log     = "0.4"
+log        = "0.4"
 env_logger = "0.11"
 
 [dev-dependencies]
-# Jeux de données synthétiques pour les tests
 approx = "0.5"   # Comparaisons flottantes dans les tests
 ```
 
@@ -115,10 +111,10 @@ approx = "0.5"   # Comparaisons flottantes dans les tests
 | Crate | Rôle dans Boruta |
 |---|---|
 | `ndarray` | Stockage et manipulation des matrices X (features × observations). Opérations de slicing, shuffling par colonne, concaténation. |
-| `smartcore` | Entraînement de la Random Forest à chaque itération. Fournit `feature_importances_` (MDI — Mean Decrease Impurity). |
-| `rand` + `rand_distr` | Shuffling aléatoire des colonnes pour créer les shadow features. Reproductibilité via `SeedableRng`. |
+| `smartcore` | `DecisionTreeClassifier` — brique de base de la Random Forest custom (bootstrap + OOB). |
+| `rand` + `rand_chacha` + `rand_distr` | Shuffling aléatoire des colonnes, bootstrap reproductible via `ChaCha8Rng`. |
 | `statrs` | Test binomial (décision Confirmed/Rejected), correction de Bonferroni pour les tests multiples, calcul des p-values. |
-| `rayon` | Parallélisation des arbres dans la Random Forest (`ndarray` + `rayon` via feature flag). |
+| `rayon` | Deux niveaux de parallélisme : entraînement des arbres + boucle de permutation OOB. |
 | `serde` + `serde_json` | Sérialisation du résultat `BorutaResult` (liste de features confirmées, rejetées, tentatives). |
 
 ---
@@ -195,21 +191,24 @@ use rand_chacha::ChaCha8Rng;
 /// Concatène X avec ses copies shufflées (shadow features).
 /// Retourne une matrice de dimension [n_obs, 2 * n_features].
 ///
-/// Les colonnes [0..n_features]          → features originales
-/// Les colonnes [n_features..2*n_features] → shadow features
+/// Les colonnes [0..n_features)          → features originales
+/// Les colonnes [n_features..2*n_features) → shadow features
 pub fn create_shadow_matrix(x: &Array2<f64>, seed: u64) -> Array2<f64> {
-    let (n_obs, n_features) = x.dim();
+    let (_, n_features) = x.dim();
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
 
-    // Copie de X pour les shadows
     let mut shadow = x.clone();
 
-    // Shuffle indépendant colonne par colonne
-    for mut col in shadow.axis_iter_mut(Axis(1)) {
-        // Convertir la vue en slice mutable pour SliceRandom
-        let slice = col.as_slice_mut()
-            .expect("La matrice doit être contiguous en mémoire");
-        slice.shuffle(&mut rng);
+    // Shuffle indépendant colonne par colonne.
+    // Les matrices ndarray sont row-major : les colonnes ne sont pas contiguës
+    // en mémoire, donc `as_slice_mut()` paniquerait. On copie dans un Vec,
+    // on shuffle, puis on réassigne valeur par valeur.
+    for j in 0..n_features {
+        let mut col: Vec<f64> = shadow.column(j).to_vec();
+        col.shuffle(&mut rng);
+        for (i, val) in col.into_iter().enumerate() {
+            shadow[[i, j]] = val;
+        }
     }
 
     // Concaténation horizontale : [X | shadow]
@@ -217,14 +216,14 @@ pub fn create_shadow_matrix(x: &Array2<f64>, seed: u64) -> Array2<f64> {
         .expect("Les matrices doivent avoir le même nombre de lignes")
 }
 
-/// Retourne uniquement les indices des colonnes shadow dans la matrice étendue.
+/// Retourne les indices des colonnes shadow dans la matrice étendue.
 pub fn shadow_indices(n_features: usize) -> std::ops::Range<usize> {
     n_features..(2 * n_features)
 }
 ```
 
 > **Pourquoi `ChaCha8Rng` ?**
-> `rand_chacha` est reproductible, rapide, et disponible dans `rand`. Il suffit de passer un `seed` fixe pour rendre les expériences déterministes.
+> `rand_chacha` est reproductible, rapide, et seedable. Un seed fixe suffit pour rendre les expériences déterministes.
 
 ---
 
@@ -232,63 +231,93 @@ pub fn shadow_indices(n_features: usize) -> std::ops::Range<usize> {
 
 **Fichier : `src/importance.rs`**
 
-On utilise `smartcore::ensemble::random_forest_classifier::RandomForestClassifier` (ou `Regressor` pour la régression). Après fit, `feature_importances()` retourne le **Mean Decrease Impurity (MDI)** pour chaque colonne de la matrice étendue.
+L'importance est calculée par **permutation OOB** (Out-of-Bag) plutôt que par MDI (Mean Decrease Impurity). L'approche :
+
+1. **Construire `n_estimators` arbres en parallèle** (rayon), chacun entraîné sur un bootstrap sample. Pour chaque arbre on retient le masque OOB (les observations non incluses dans le bootstrap).
+2. **Calculer la précision OOB de base** : pour chaque observation, seuls les arbres dont elle est OOB votent. Majorité des votes → classe prédite.
+3. **Pour chaque colonne `j`**, permuter aléatoirement ses valeurs dans la matrice complète et recalculer la précision OOB. La chute de précision = importance de la feature `j`.
+
+Cette approche évite le biais du MDI (qui favorise les variables continues ou à haute cardinalité) et donne une séparation nette entre features réelles et shadow features.
 
 ```rust
-// src/importance.rs
+// src/importance.rs (extraits simplifiés)
 use ndarray::{Array1, Array2};
-use smartcore::ensemble::random_forest_classifier::{
-    RandomForestClassifier, RandomForestClassifierParameters,
-};
+use rand::seq::SliceRandom;
+use rand::SeedableRng;
+use rand_chacha::ChaCha8Rng;
+use rayon::prelude::*;
 use smartcore::linalg::basic::matrix::DenseMatrix;
+use smartcore::tree::decision_tree_classifier::{
+    DecisionTreeClassifier, DecisionTreeClassifierParameters,
+};
 
-/// Entraîne une Random Forest sur (x_extended, y) et retourne
-/// le vecteur d'importance de chaque colonne (longueur = 2 * n_features).
+type Tree = DecisionTreeClassifier<f64, u32, DenseMatrix<f64>, Vec<u32>>;
+
+/// Entraîne n_estimators arbres en parallèle, chacun sur un bootstrap sample.
+/// Retourne chaque arbre + son masque OOB (true = observation absente du bootstrap).
+fn train_forest_parallel(
+    rows: &[Vec<f64>],
+    y_vec: &[u32],
+    n_estimators: usize,
+    seed: u64,
+) -> Vec<(Tree, Vec<bool>)> {
+    (0..n_estimators)
+        .into_par_iter()
+        .map(|i| {
+            let mut rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(i as u64));
+            let indices: Vec<usize> =
+                (0..rows.len()).map(|_| rng.gen_range(0..rows.len())).collect();
+            let mut in_bag = vec![false; rows.len()];
+            for &idx in &indices { in_bag[idx] = true; }
+            let oob_mask: Vec<bool> = in_bag.into_iter().map(|b| !b).collect();
+
+            let boot_rows: Vec<Vec<f64>> = indices.iter().map(|&j| rows[j].clone()).collect();
+            let y_boot: Vec<u32> = indices.iter().map(|&j| y_vec[j]).collect();
+            let x_boot = DenseMatrix::from_2d_vec(&boot_rows);
+            let params = DecisionTreeClassifierParameters {
+                seed: Some(seed.wrapping_add(1_000_000).wrapping_add(i as u64)),
+                ..Default::default()
+            };
+            let tree = DecisionTreeClassifier::fit(&x_boot, &y_boot, params).unwrap();
+            (tree, oob_mask)
+        })
+        .collect()
+}
+
+/// Calcule la précision OOB : chaque observation est prédite uniquement
+/// par les arbres dont elle était absente au bootstrap.
+fn oob_accuracy(forest: &[(Tree, Vec<bool>)], rows: &[Vec<f64>], y: &[u32], n_classes: usize) -> f64 {
+    // votes[sample][class] accumulés sur tous les arbres OOB
+    // ...
+}
+
+/// Point d'entrée public : importance[j] = (baseline_acc - perm_acc_j).max(0.0)
 pub fn compute_importances(
     x_extended: &Array2<f64>,
     y: &Array1<u32>,
     n_estimators: usize,
     seed: u64,
 ) -> Vec<f64> {
-    let (n_obs, n_cols) = x_extended.dim();
-
-    // Conversion ndarray → DenseMatrix (format attendu par smartcore)
-    let x_sm = DenseMatrix::from_2d_vec(
-        &x_extended
-            .rows()
-            .into_iter()
-            .map(|row| row.to_vec())
-            .collect::<Vec<_>>(),
-    );
-
-    let y_vec: Vec<u32> = y.to_vec();
-
-    // Paramètres de la Random Forest
-    let params = RandomForestClassifierParameters::default()
-        .with_n_trees(n_estimators)
-        .with_seed(seed);
-
-    let rf = RandomForestClassifier::fit(&x_sm, &y_vec, params)
-        .expect("Échec de l'entraînement Random Forest");
-
-    // feature_importances() retourne un Vec<f64> de longueur n_cols
-    rf.feature_importances()
-        .expect("Impossible d'extraire les importances")
+    // Étape 1 : entraînement parallèle de la forêt
+    let forest = train_forest_parallel(&rows, &y_vec, n_estimators, seed);
+    // Étape 2 : précision OOB de base
+    let baseline_acc = oob_accuracy(&forest, &rows, &y_vec, n_classes);
+    // Étape 3 : boucle de permutation parallèle
+    (0..n_cols)
+        .into_par_iter()
+        .map(|j| {
+            // permuter la colonne j, recalculer l'accuracy OOB
+            let perm_acc = oob_accuracy(&forest, &rows_perm_j, &y_vec, n_classes);
+            (baseline_acc - perm_acc).max(0.0)
+        })
+        .collect()
 }
 
-/// Sépare le vecteur d'importances en :
-///   - importances des features originales (indices 0..n_features)
-///   - importances des shadow features     (indices n_features..2*n_features)
-pub fn split_importances(
-    importances: &[f64],
-    n_features: usize,
-) -> (&[f64], &[f64]) {
+/// Sépare le vecteur d'importances en (features originales, shadow features).
+pub fn split_importances(importances: &[f64], n_features: usize) -> (&[f64], &[f64]) {
     (&importances[..n_features], &importances[n_features..])
 }
 ```
-
-> **Note sur `linfa` comme alternative :**
-> Si vous préférez `linfa` + `linfa-trees`, l'API diffère légèrement mais le principe est identique : `linfa_trees::RandomForest::fit(dataset)` puis `.feature_importances()`. Consultez la doc de `linfa` pour l'intégration avec `linfa::Dataset`.
 
 ---
 
@@ -796,11 +825,14 @@ mod tests {
 
 use boruta_rs::{Boruta, BorutaConfig, FeatureStatus};
 use ndarray::{Array1, Array2};
-use rand::{Rng, SeedableRng};
+use rand::Rng;
+use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
-/// Génère un dataset synthétique avec n_informative features utiles
-/// et n_noise features purement aléatoires.
+/// Génère un dataset synthétique :
+/// - `n_informative` features sont Uniforme(-2, 2) ; le label = signe de leur somme.
+///   Chaque feature contribue individuellement à la prédiction.
+/// - `n_noise` features sont Uniforme(-2, 2) indépendantes du label.
 fn make_classification(
     n_obs: usize,
     n_informative: usize,
@@ -809,21 +841,19 @@ fn make_classification(
 ) -> (Array2<f64>, Array1<u32>) {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let n_features = n_informative + n_noise;
-    let mut data = Vec::with_capacity(n_obs * n_features);
+    let mut data = vec![0.0f64; n_obs * n_features];
     let mut labels = Vec::with_capacity(n_obs);
 
-    for _ in 0..n_obs {
-        let label: u32 = rng.gen_range(0..2);
-        labels.push(label);
-        for j in 0..n_features {
-            let val = if j < n_informative {
-                // Features utiles : corrélées au label
-                label as f64 + rng.gen::<f64>() * 0.5
-            } else {
-                // Features bruit : purement aléatoires
-                rng.gen::<f64>()
-            };
-            data.push(val);
+    for i in 0..n_obs {
+        let mut sum = 0.0f64;
+        for j in 0..n_informative {
+            let val: f64 = (rng.gen::<f64>() - 0.5) * 4.0; // Uniforme(-2, 2)
+            data[i * n_features + j] = val;
+            sum += val;
+        }
+        labels.push(if sum > 0.0 { 1u32 } else { 0u32 });
+        for j in n_informative..n_features {
+            data[i * n_features + j] = (rng.gen::<f64>() - 0.5) * 4.0;
         }
     }
 
@@ -833,20 +863,20 @@ fn make_classification(
 }
 
 #[test]
-fn test_boruta_detecte_features_informatives() {
-    let (x, y) = make_classification(300, 5, 5, 42);
+fn test_boruta_detects_informative_features() {
+    let (x, y) = make_classification(500, 5, 5, 42);
 
     let config = BorutaConfig {
-        max_iter: 50,
+        max_iter: 100,
         p_value: 0.01,
         bonferroni: true,
-        n_estimators: 50,
+        n_estimators: 100,
         random_seed: Some(42),
     };
 
     let result = Boruta::new(config).fit(&x, &y);
 
-    // Les 5 premières features (informatives) doivent être confirmées
+    // Les 5 premières features (informatives) doivent être Confirmed
     for i in 0..5 {
         assert_eq!(
             result.statuses[i],
@@ -856,7 +886,7 @@ fn test_boruta_detecte_features_informatives() {
         );
     }
 
-    // Les 5 dernières (bruit) doivent être rejetées
+    // Les 5 dernières (bruit) ne doivent pas être Confirmed
     for i in 5..10 {
         assert_ne!(
             result.statuses[i],
@@ -931,7 +961,7 @@ boruta-rs utilise l'**importance OOB par permutation** (les shadow features obti
 | 🔴 Haute | Support régression (target `f64`) en plus de la classification |
 | 🔴 Haute | Benchmarks sur datasets réels (UCI, Iris, Wine) — ✅ benchmark synthétique disponible (section 13) |
 | 🟡 Moyenne | `TentativeRoughFix` : test de seuil simple pour trancher les Tentative restantes |
-| 🟡 Moyenne | Importance par permutation (PFI) en alternative au MDI |
+| ✅ Fait | Importance par permutation OOB (plus robuste que le MDI) |
 | 🟡 Moyenne | Support `linfa` en plus de `smartcore` (feature flag Cargo) |
 | 🟢 Basse | Export des courbes d'importance (historique) vers CSV / plotters |
 | 🟢 Basse | Interface Python via `pyo3` pour interopérabilité |

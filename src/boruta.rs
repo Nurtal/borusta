@@ -2,7 +2,7 @@ use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
 
 use crate::decision::update_decisions;
-use crate::importance::{compute_importances, split_importances};
+use crate::importance::{compute_importances, compute_importances_regression, split_importances};
 use crate::shadow::create_shadow_matrix;
 
 /// Status of a feature after selection.
@@ -66,6 +66,7 @@ impl Boruta {
     /// # Returns
     /// A [`BorutaResult`] with the status of each feature.
     pub fn fit(&self, x: &Array2<f64>, y: &Array1<u32>) -> BorutaResult {
+        validate_inputs(x, y.len());
         let n_features = x.ncols();
         let seed_base = self.config.random_seed.unwrap_or(42);
 
@@ -162,6 +163,108 @@ impl Boruta {
             importance_history,
         }
     }
+
+    /// Runs the Boruta algorithm for **regression** targets (continuous `y: f64`).
+    ///
+    /// Feature importance is measured by OOB MSE drop after permutation.
+    /// Everything else (shadow features, binomial test, convergence) is identical
+    /// to the classification variant.
+    pub fn fit_regression(&self, x: &Array2<f64>, y: &Array1<f64>) -> BorutaResult {
+        validate_inputs(x, y.len());
+        let n_features = x.ncols();
+        let seed_base = self.config.random_seed.unwrap_or(42);
+
+        let mut statuses = vec![FeatureStatus::Tentative; n_features];
+        let mut hits = vec![0u64; n_features];
+        let mut importance_history: Vec<Vec<f64>> = vec![Vec::new(); n_features];
+        let mut n_iter = 0;
+
+        for iter in 0..self.config.max_iter {
+            n_iter = iter + 1;
+
+            let all_decided = statuses.iter().all(|s| *s != FeatureStatus::Tentative);
+            if all_decided {
+                log::info!("Convergence reached at iteration {}", n_iter);
+                break;
+            }
+
+            let active_mask: Vec<bool> = statuses
+                .iter()
+                .map(|s| *s != FeatureStatus::Rejected)
+                .collect();
+
+            let x_active = filter_columns(x, &active_mask);
+            let n_active = x_active.ncols();
+
+            let x_extended = create_shadow_matrix(&x_active, seed_base + iter as u64);
+            let importances = compute_importances_regression(
+                &x_extended,
+                y,
+                self.config.n_estimators,
+                seed_base + iter as u64,
+            );
+
+            let (orig_imp, shadow_imp) = split_importances(&importances, n_active);
+
+            let max_shadow = shadow_imp
+                .iter()
+                .cloned()
+                .fold(f64::NEG_INFINITY, f64::max);
+
+            let mut active_idx = 0;
+            for orig_idx in 0..n_features {
+                if statuses[orig_idx] == FeatureStatus::Rejected {
+                    importance_history[orig_idx].push(0.0);
+                } else {
+                    let imp = orig_imp[active_idx];
+                    importance_history[orig_idx].push(imp);
+                    if imp > max_shadow {
+                        hits[orig_idx] += 1;
+                    }
+                    active_idx += 1;
+                }
+            }
+
+            update_decisions(
+                &hits,
+                n_iter,
+                self.config.p_value,
+                self.config.bonferroni,
+                &mut statuses,
+            );
+
+            log::debug!(
+                "Iter {:3} | Confirmed: {} | Rejected: {} | Tentative: {}",
+                n_iter,
+                statuses.iter().filter(|s| **s == FeatureStatus::Confirmed).count(),
+                statuses.iter().filter(|s| **s == FeatureStatus::Rejected).count(),
+                statuses.iter().filter(|s| **s == FeatureStatus::Tentative).count(),
+            );
+        }
+
+        BorutaResult {
+            statuses,
+            feature_names: None,
+            n_iterations: n_iter,
+            importance_history,
+        }
+    }
+} // impl Boruta
+
+/// Validates that `x` contains no NaN/Inf and that `y` has the same length.
+/// Panics with a clear message on failure.
+fn validate_inputs(x: &Array2<f64>, n_labels: usize) {
+    assert_eq!(
+        x.nrows(),
+        n_labels,
+        "x and y must have the same number of rows (x: {}, y: {})",
+        x.nrows(),
+        n_labels
+    );
+    assert!(
+        x.iter().all(|v| v.is_finite()),
+        "x contains NaN or Inf — impute or drop them before running Boruta"
+    );
 }
 
 /// Selects columns of `x` according to a boolean mask.
