@@ -1,0 +1,20 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "boruta-rs"
+version = "0.1.0"
+description = "Fast parallel Boruta feature selection — Rust backend via PyO3"
+requires-python = ">=3.8"
+dependencies = ["numpy"]
+
+[tool.maturin]
+# Rust crate is in the parent directory
+manifest-path = "../Cargo.toml"
+features = ["python"]
+# The extension module name must match the #[pymodule] function name
+module-name = "boruta_rs"
+python-source = "."
+# Only build the library, not the benchmark binaries
+bindings = "pyo3"

@@ -1,10 +1,21 @@
 pub mod boruta;
 pub mod decision;
 pub mod importance;
+pub mod python;
 pub mod shadow;
 pub mod stats;
 
 pub use boruta::{Boruta, BorutaConfig, BorutaResult, FeatureStatus};
+
+#[cfg(feature = "python")]
+use pyo3::prelude::*;
+
+/// Entry point for the Python extension module (built with maturin).
+#[cfg(feature = "python")]
+#[pymodule]
+fn boruta_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    python::bindings::register(m)
+}
 
 fn median_sorted(sorted: &[f64]) -> f64 {
     let n = sorted.len();

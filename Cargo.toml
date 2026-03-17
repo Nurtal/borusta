@@ -2,6 +2,16 @@
 name = "boruta-rs"
 version = "0.1.0"
 edition = "2021"
+description = "Fast parallel Boruta feature selection algorithm in Rust — OOB permutation importance, classification and regression"
+license = "MIT"
+repository = "https://github.com/Nurtal/borusta"
+keywords = ["machine-learning", "feature-selection", "random-forest", "boruta"]
+categories = ["science", "algorithms"]
+readme = "README.md"
+
+# cdylib for the Python extension, rlib for normal Rust usage
+[lib]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 ndarray = { version = "0.16", features = ["rayon"] }
@@ -15,6 +25,13 @@ statrs = "0.16"
 rayon = "1.10"
 log = "0.4"
 env_logger = "0.11"
+
+# Python bindings (opt-in via --features python)
+pyo3  = { version = "0.22", features = ["extension-module"], optional = true }
+numpy = { version = "0.22", optional = true }
+
+[features]
+python = ["pyo3", "numpy"]
 
 [dev-dependencies]
 approx = "0.5"

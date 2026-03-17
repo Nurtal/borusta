@@ -28,6 +28,7 @@ pub struct BorutaResult {
 }
 
 /// Configuration for the Boruta algorithm.
+#[derive(Clone)]
 pub struct BorutaConfig {
     /// Maximum number of iterations (default: 100).
     pub max_iter: usize,
