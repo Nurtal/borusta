@@ -4,3 +4,4 @@ benchmark/
 __pycache__/
 *.so
 *.pyc
+CLAUDE.md
