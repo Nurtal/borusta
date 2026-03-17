@@ -2,7 +2,7 @@
 
 > Implémentation de l'algorithme Boruta en Rust — sélection de features "all-relevant" basée sur Random Forest.
 
-![bench](https://img.shields.io/badge/benchmark-~1.3s%20(500obs%2C%2016cores)-brightgreen)
+![bench](https://img.shields.io/badge/benchmark-~1.4s%20(500obs%2C%2016cores)-brightgreen)
 
 ---
 
@@ -936,11 +936,11 @@ Rscript benchmark/bench_r.R
 
 | Implémentation | Confirmed | Rejected | Itérations | Temps moyen |
 |---|---|---|---|---|
-| **boruta-rs** (Rust, parallèle) | f0–f4 ✅ | f5–f9 ✅ | ~18 | **~1.3s** |
+| **boruta-rs** (Rust, parallèle) | f0–f4 ✅ | f5–f9 ✅ | 18 | **~1.4s** |
 | BorutaPy (Python, `n_jobs=-1`) | f0–f4 ✅ | f5–f9 ✅ | auto | ~3.2s |
-| Boruta (R, package original) | f0–f4 ✅ | f5–f9 ✅ | ~273 | ~8.4s |
+| Boruta (R, package original) | f0–f4 ✅ | f5–f9 ✅ | 273 | ~8.4s |
 
-Les trois implémentations produisent des résultats **identiques**. boruta-rs est **2.4× plus rapide que Python** et **6.5× plus rapide que R**.
+Les trois implémentations produisent des résultats **identiques**. boruta-rs est **2.4× plus rapide que Python** et **6.2× plus rapide que R**.
 
 ### Notes sur les différences de méthode
 
@@ -958,10 +958,12 @@ boruta-rs utilise l'**importance OOB par permutation** (les shadow features obti
 
 | Priorité | Fonctionnalité |
 |---|---|
-| 🔴 Haute | Support régression (target `f64`) en plus de la classification |
-| 🔴 Haute | Benchmarks sur datasets réels (UCI, Iris, Wine) — ✅ benchmark synthétique disponible (section 13) |
-| 🟡 Moyenne | `TentativeRoughFix` : test de seuil simple pour trancher les Tentative restantes |
+| ✅ Fait | Support régression — `Boruta::fit_regression(x, y: &Array1<f64>)` |
 | ✅ Fait | Importance par permutation OOB (plus robuste que le MDI) |
+| ✅ Fait | Validation des entrées — panique claire sur NaN/Inf ou désalignement x/y |
+| ✅ Fait | Support multi-classes (classification à N classes, N ≥ 2) |
+| 🔴 Haute | Benchmarks sur datasets réels (UCI, Iris, Wine) |
+| 🟡 Moyenne | `TentativeRoughFix` : test de seuil simple pour trancher les Tentative restantes |
 | 🟡 Moyenne | Support `linfa` en plus de `smartcore` (feature flag Cargo) |
 | 🟢 Basse | Export des courbes d'importance (historique) vers CSV / plotters |
 | 🟢 Basse | Interface Python via `pyo3` pour interopérabilité |
