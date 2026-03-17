@@ -1,87 +1,175 @@
 use ndarray::{Array1, Array2};
+use rand::Rng;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
-use smartcore::ensemble::random_forest_classifier::{
-    RandomForestClassifier, RandomForestClassifierParameters,
-};
+use rayon::prelude::*;
 use smartcore::linalg::basic::matrix::DenseMatrix;
+use smartcore::tree::decision_tree_classifier::{
+    DecisionTreeClassifier, DecisionTreeClassifierParameters,
+};
 
-/// Trains a Random Forest on `(x_extended, y)` and returns OOB permutation importance
-/// for every column (length = `x_extended.ncols()`).
+// Concrete tree type used throughout — avoids repeating the four type params.
+type Tree = DecisionTreeClassifier<f64, u32, DenseMatrix<f64>, Vec<u32>>;
+
+// ── Parallel forest training ──────────────────────────────────────────────────
+
+/// Trains `n_estimators` decision trees **in parallel** (rayon), each on a
+/// bootstrap sample of the dataset.
 ///
-/// Importance[j] = drop in OOB accuracy when column j is randomly permuted.
-/// Using OOB (out-of-bag) samples avoids the overfitting bias of train-set importance.
-/// Values are clamped to ≥ 0 so that noise features don't produce negative importance.
+/// Returns every tree together with a boolean OOB mask (true = sample was
+/// NOT included in that tree's bootstrap).
+fn train_forest_parallel(
+    rows: &[Vec<f64>],
+    y_vec: &[u32],
+    n_estimators: usize,
+    seed: u64,
+) -> Vec<(Tree, Vec<bool>)> {
+    let n_obs = rows.len();
+
+    (0..n_estimators)
+        .into_par_iter()
+        .map(|i| {
+            let mut rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(i as u64));
+
+            // Bootstrap: draw n_obs indices with replacement
+            let indices: Vec<usize> =
+                (0..n_obs).map(|_| rng.gen_range(0..n_obs)).collect();
+
+            let mut in_bag = vec![false; n_obs];
+            for &idx in &indices {
+                in_bag[idx] = true;
+            }
+            let oob_mask: Vec<bool> = in_bag.into_iter().map(|b| !b).collect();
+
+            // Build bootstrap matrices
+            let boot_rows: Vec<Vec<f64>> =
+                indices.iter().map(|&j| rows[j].clone()).collect();
+            let y_boot: Vec<u32> = indices.iter().map(|&j| y_vec[j]).collect();
+            let x_boot = DenseMatrix::from_2d_vec(&boot_rows);
+
+            let params = DecisionTreeClassifierParameters {
+                seed: Some(seed.wrapping_add(1_000_000).wrapping_add(i as u64)),
+                ..Default::default()
+            };
+            let tree = DecisionTreeClassifier::fit(&x_boot, &y_boot, params)
+                .expect("decision tree training failed");
+
+            (tree, oob_mask)
+        })
+        .collect()
+}
+
+// ── OOB accuracy ─────────────────────────────────────────────────────────────
+
+/// Computes OOB accuracy for the given row set.
+///
+/// For each sample, only trees whose bootstrap did NOT include that sample
+/// vote on its class. Samples covered by no OOB tree are skipped.
+fn oob_accuracy(
+    forest: &[(Tree, Vec<bool>)],
+    rows: &[Vec<f64>],
+    y_vec: &[u32],
+    n_classes: usize,
+) -> f64 {
+    let n_obs = rows.len();
+    let x_sm = DenseMatrix::from_2d_vec(&rows.to_vec());
+
+    // votes[sample][class] — accumulated across all OOB trees
+    let mut votes: Vec<Vec<u32>> = vec![vec![0u32; n_classes]; n_obs];
+
+    for (tree, oob_mask) in forest {
+        let preds: Vec<u32> = tree.predict(&x_sm).expect("predict failed");
+        for (i, (&pred, &is_oob)) in preds.iter().zip(oob_mask.iter()).enumerate() {
+            if is_oob {
+                let cls = pred as usize;
+                if cls < n_classes {
+                    votes[i][cls] += 1;
+                }
+            }
+        }
+    }
+
+    let mut correct = 0usize;
+    let mut n_valid = 0usize;
+    for (vote_row, &true_label) in votes.iter().zip(y_vec.iter()) {
+        if vote_row.iter().sum::<u32>() == 0 {
+            continue; // sample has no OOB tree — skip
+        }
+        n_valid += 1;
+        let predicted = vote_row
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, &v)| v)
+            .map(|(c, _)| c as u32)
+            .unwrap_or(0);
+        if predicted == true_label {
+            correct += 1;
+        }
+    }
+
+    if n_valid == 0 {
+        0.0
+    } else {
+        correct as f64 / n_valid as f64
+    }
+}
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+/// Trains a Random Forest **in parallel** and returns OOB permutation importance
+/// for every column of `x_extended` (length = `x_extended.ncols()`).
+///
+/// Two levels of parallelism via rayon:
+/// 1. Tree training   — each of the `n_estimators` trees trains on its own
+///    bootstrap sample independently.
+/// 2. Permutation loop — each of the `n_cols` columns is permuted and evaluated
+///    independently.
 pub fn compute_importances(
     x_extended: &Array2<f64>,
     y: &Array1<u32>,
     n_estimators: usize,
     seed: u64,
 ) -> Vec<f64> {
-    let n_obs = x_extended.nrows();
     let n_cols = x_extended.ncols();
-
-    // Convert ndarray → DenseMatrix (row-major Vec<Vec<f64>>)
     let rows: Vec<Vec<f64>> = x_extended
         .rows()
         .into_iter()
-        .map(|row| row.to_vec())
+        .map(|r| r.to_vec())
         .collect();
-    let x_sm = DenseMatrix::from_2d_vec(&rows);
     let y_vec: Vec<u32> = y.to_vec();
+    let n_classes = (*y_vec.iter().max().unwrap_or(&0) as usize) + 1;
 
-    // Train with keep_samples=true so OOB prediction is available
-    let params = RandomForestClassifierParameters::default()
-        .with_n_trees(n_estimators as u16)
-        .with_seed(seed)
-        .with_keep_samples(true);
+    // Step 1 — parallel tree training
+    let forest = train_forest_parallel(&rows, &y_vec, n_estimators, seed);
 
-    let rf = RandomForestClassifier::fit(&x_sm, &y_vec, params)
-        .expect("Random Forest training failed");
+    // Step 2 — baseline OOB accuracy
+    let baseline_acc = oob_accuracy(&forest, &rows, &y_vec, n_classes);
 
-    // Baseline OOB accuracy (each sample predicted only by trees that did not see it)
-    let baseline_preds: Vec<u32> = rf.predict_oob(&x_sm).expect("OOB predict failed");
-    let baseline_acc: f64 = baseline_preds
-        .iter()
-        .zip(y_vec.iter())
-        .filter(|(p, t)| p == t)
-        .count() as f64
-        / n_obs as f64;
+    // Step 3 — parallel permutation importance
+    (0..n_cols)
+        .into_par_iter()
+        .map(|j| {
+            let mut rng = ChaCha8Rng::seed_from_u64(
+                seed.wrapping_add(2_000_000).wrapping_add(j as u64),
+            );
+            let mut col_perm: Vec<f64> = x_extended.column(j).to_vec();
+            col_perm.shuffle(&mut rng);
 
-    // OOB permutation importance: for each column, shuffle it and measure OOB accuracy drop
-    let mut importances = vec![0.0f64; n_cols];
-    let mut rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(1_000_000));
+            let rows_perm: Vec<Vec<f64>> = rows
+                .iter()
+                .enumerate()
+                .map(|(i, row)| {
+                    let mut r = row.clone();
+                    r[j] = col_perm[i];
+                    r
+                })
+                .collect();
 
-    for j in 0..n_cols {
-        let mut col_perm: Vec<f64> = x_extended.column(j).to_vec();
-        col_perm.shuffle(&mut rng);
-
-        // Build a new row set with column j replaced by the permuted values
-        let rows_perm: Vec<Vec<f64>> = rows
-            .iter()
-            .enumerate()
-            .map(|(i, row)| {
-                let mut r = row.clone();
-                r[j] = col_perm[i];
-                r
-            })
-            .collect();
-        let x_perm_sm = DenseMatrix::from_2d_vec(&rows_perm);
-
-        // predict_oob checks that the row count matches training data — it does (same n_obs)
-        let perm_preds: Vec<u32> = rf.predict_oob(&x_perm_sm).expect("OOB predict failed");
-        let perm_acc: f64 = perm_preds
-            .iter()
-            .zip(y_vec.iter())
-            .filter(|(p, t)| p == t)
-            .count() as f64
-            / n_obs as f64;
-
-        importances[j] = (baseline_acc - perm_acc).max(0.0);
-    }
-
-    importances
+            let perm_acc = oob_accuracy(&forest, &rows_perm, &y_vec, n_classes);
+            (baseline_acc - perm_acc).max(0.0)
+        })
+        .collect()
 }
 
 /// Splits a flat importance vector into `(original_features, shadow_features)`.
