@@ -1,5 +1,6 @@
 /target
 .venv/
+benchmark/
 __pycache__/
 *.so
 *.pyc
