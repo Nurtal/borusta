@@ -297,6 +297,57 @@ fn test_boruta_regression() {
     }
 }
 
+// ── TentativeRoughFix ────────────────────────────────────────────────────────
+
+#[test]
+fn test_tentative_rough_fix_resolves_all() {
+    // Use very few iterations to guarantee some Tentative features remain
+    let (x, y) = make_classification(300, 5, 5, 42);
+    let config = BorutaConfig {
+        max_iter: 5,
+        p_value: 0.01,
+        bonferroni: true,
+        n_estimators: 50,
+        random_seed: Some(42),
+    };
+    let mut result = Boruta::new(config).fit(&x, &y);
+
+    result.tentative_rough_fix();
+
+    // After rough_fix, no features should remain Tentative
+    assert!(
+        result.tentative_indices().is_empty(),
+        "tentative_rough_fix should resolve all Tentative features"
+    );
+}
+
+// ── CSV export ────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_importance_history_csv() {
+    let (x, y) = make_classification(200, 3, 3, 5);
+    let config = BorutaConfig {
+        max_iter: 10,
+        p_value: 0.01,
+        bonferroni: false,
+        n_estimators: 20,
+        random_seed: Some(5),
+    };
+    let result = Boruta::new(config).fit(&x, &y);
+    let csv = result.importance_history_to_csv();
+
+    let lines: Vec<&str> = csv.lines().collect();
+    // First line is the header
+    assert!(lines[0].starts_with("iteration,"));
+    // 6 feature columns + "iteration" = 7 columns
+    assert_eq!(lines[0].split(',').count(), 7);
+    // At least one data row
+    assert!(lines.len() > 1);
+    // Data rows = importance_history[0].len() (may differ from n_iterations when
+    // convergence is detected at the start of an iteration before any push)
+    assert_eq!(lines.len() - 1, result.importance_history[0].len());
+}
+
 // ── NA validation ─────────────────────────────────────────────────────────────
 
 #[test]

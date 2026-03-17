@@ -21,6 +21,10 @@ pub struct BorutaResult {
     pub n_iterations: usize,
     /// importance_history[feature_index][iteration]
     pub importance_history: Vec<Vec<f64>>,
+    /// max_shadow_history[iteration] = max shadow importance at that iteration.
+    /// Used by `tentative_rough_fix` to resolve undecided features.
+    #[serde(default)]
+    pub max_shadow_history: Vec<f64>,
 }
 
 /// Configuration for the Boruta algorithm.
@@ -75,6 +79,7 @@ impl Boruta {
         let mut hits = vec![0u64; n_features];
         // importance_history[feature][iteration]
         let mut importance_history: Vec<Vec<f64>> = vec![Vec::new(); n_features];
+        let mut max_shadow_history: Vec<f64> = Vec::new();
 
         let mut n_iter = 0;
 
@@ -113,6 +118,7 @@ impl Boruta {
                 .iter()
                 .cloned()
                 .fold(f64::NEG_INFINITY, f64::max);
+            max_shadow_history.push(max_shadow);
 
             // Step 4: record importance and count hits (map active→original indices)
             let mut active_idx = 0;
@@ -161,6 +167,7 @@ impl Boruta {
             feature_names: None,
             n_iterations: n_iter,
             importance_history,
+            max_shadow_history,
         }
     }
 
@@ -177,6 +184,7 @@ impl Boruta {
         let mut statuses = vec![FeatureStatus::Tentative; n_features];
         let mut hits = vec![0u64; n_features];
         let mut importance_history: Vec<Vec<f64>> = vec![Vec::new(); n_features];
+        let mut max_shadow_history: Vec<f64> = Vec::new();
         let mut n_iter = 0;
 
         for iter in 0..self.config.max_iter {
@@ -210,6 +218,7 @@ impl Boruta {
                 .iter()
                 .cloned()
                 .fold(f64::NEG_INFINITY, f64::max);
+            max_shadow_history.push(max_shadow);
 
             let mut active_idx = 0;
             for orig_idx in 0..n_features {
@@ -247,6 +256,7 @@ impl Boruta {
             feature_names: None,
             n_iterations: n_iter,
             importance_history,
+            max_shadow_history,
         }
     }
 } // impl Boruta

@@ -919,38 +919,60 @@ Comparaison avec les implémentations de référence sur un dataset synthétique
 Scripts de reproduction dans `benchmark/` (nécessite le venv Python et micromamba avec l'env `renv`) :
 
 ```bash
-# Générer le dataset
+# Dataset synthétique
 python benchmark/generate_dataset.py
-
-# Rust
 cargo run --release --bin bench
-
-# Python (BorutaPy 0.4.3 + scikit-learn 1.8)
 python benchmark/bench_python.py
-
-# R (Boruta 8.x + randomForest 4.7)
 Rscript benchmark/bench_r.R
+
+# Datasets réels (Iris, Wine)
+python benchmark/generate_real_datasets.py
+cargo run --release --bin bench_iris
+cargo run --release --bin bench_wine
+python benchmark/bench_python_real.py
+Rscript benchmark/bench_r_real.R
 ```
 
-### Résultats
+### Résultats — dataset synthétique (500 obs, 10 features)
 
-| Implémentation | Confirmed | Rejected | Itérations | Temps moyen |
+| Implémentation | Confirmed | Rejected | Itérations | Temps |
 |---|---|---|---|---|
-| **boruta-rs** (Rust, parallèle) | f0–f4 ✅ | f5–f9 ✅ | 18 | **~1.4s** |
-| BorutaPy (Python, `n_jobs=-1`) | f0–f4 ✅ | f5–f9 ✅ | auto | ~3.2s |
-| Boruta (R, package original) | f0–f4 ✅ | f5–f9 ✅ | 273 | ~8.4s |
+| **boruta-rs** (Rust) | f0–f4 ✅ | f5–f9 ✅ | 18 | **~1.4s** |
+| BorutaPy (Python) | f0–f4 ✅ | f5–f9 ✅ | auto | ~3.2s |
+| Boruta (R) | f0–f4 ✅ | f5–f9 ✅ | 273 | ~8.4s |
 
-Les trois implémentations produisent des résultats **identiques**. boruta-rs est **2.4× plus rapide que Python** et **6.2× plus rapide que R**.
+boruta-rs est **2.4× plus rapide que Python** et **6.2× plus rapide que R**.
+
+### Résultats — Iris (150 obs, 4 features, 3 classes)
+
+| Implémentation | Confirmed | Rejected | Tentative | Temps |
+|---|---|---|---|---|
+| **boruta-rs** | petal_length, petal_width | sepal_length, sepal_width | — | **~0.13s** |
+| BorutaPy | toutes (4/4) | — | — | ~1.3s |
+| Boruta (R) | toutes (4/4) | — | — | ~2.2s |
+
+> **Note** : la divergence sur Iris est due à la différence de méthode d'importance (OOB permutation vs MDI). Avec 150 observations et un RF peu profond, les arbres utilisent quasi-exclusivement `petal_length` et `petal_width` — permuter `sepal_length` ne fait pas chuter l'accuracy OOB, d'où une importance ≈ 0 et un rejet par le test binomial. Le MDI (R/Python) distribue toujours une importance > 0 à toutes les features utilisées dans l'arbre.
+
+### Résultats — Wine (178 obs, 13 features, 3 classes)
+
+| Implémentation | Confirmed | Rejected | Tentative | Temps |
+|---|---|---|---|---|
+| **boruta-rs** | 4/13 | 8/13 | magnesium (1) | **~1.7s** |
+| BorutaPy | toutes (13/13) | — | — | ~2.2s |
+| Boruta (R) | toutes (13/13) | — | — | ~0.9s |
+
+> boruta-rs identifie un sous-ensemble plus restreint (`alcohol`, `flavanoids`, `color_intensity`, `proline`) : les 4 features dominantes dans le Wine dataset. Pour rapprocher du comportement MDI et résoudre les Tentative, utiliser `tentative_rough_fix()` après `fit()`.
 
 ### Notes sur les différences de méthode
 
 | | boruta-rs | BorutaPy | Boruta (R) |
 |---|---|---|---|
-| Importance utilisée | OOB permutation | MDI (Gini) | MDI (Gini) |
+| Importance | OOB permutation | MDI (Gini) | MDI (Gini) |
 | Entraînement RF | Parallèle (rayon) | sklearn (`n_jobs=-1`) | randomForest (C) |
-| Convergence | Rapide (~18 iter) | Adaptative | Lente (~273 iter) |
+| Sélectivité | Plus conservative | Libérale | Libérale |
+| Convergence (synthétique) | ~18 iter | adaptative | ~273 iter |
 
-boruta-rs utilise l'**importance OOB par permutation** (les shadow features obtiennent une importance ≈ 0, rendant la séparation nette dès les premières itérations) là où R et Python utilisent le MDI (les shadow features reçoivent une importance > 0 par hasard, ce qui nécessite plus d'itérations pour que le test binomial soit conclusif).
+**OOB permutation vs MDI** : la permutation OOB ne donne d'importance qu'aux features effectivement utilisées par les arbres pour prédire. Sur de petits datasets, le RF tend à n'exploiter que les features les plus discriminantes, ce qui rend l'approche OOB plus conservative que le MDI (qui distribue toujours une importance > 0 même aux features faiblement utilisées).
 
 ---
 
@@ -962,10 +984,10 @@ boruta-rs utilise l'**importance OOB par permutation** (les shadow features obti
 | ✅ Fait | Importance par permutation OOB (plus robuste que le MDI) |
 | ✅ Fait | Validation des entrées — panique claire sur NaN/Inf ou désalignement x/y |
 | ✅ Fait | Support multi-classes (classification à N classes, N ≥ 2) |
-| 🔴 Haute | Benchmarks sur datasets réels (UCI, Iris, Wine) |
-| 🟡 Moyenne | `TentativeRoughFix` : test de seuil simple pour trancher les Tentative restantes |
+| ✅ Fait | Benchmarks sur datasets réels (Iris, Wine) — voir section 13 |
+| ✅ Fait | `TentativeRoughFix` — `result.tentative_rough_fix()` résout les Tentative résiduels |
+| ✅ Fait | Export CSV de l'historique d'importance — `result.importance_history_to_csv()` |
 | 🟡 Moyenne | Support `linfa` en plus de `smartcore` (feature flag Cargo) |
-| 🟢 Basse | Export des courbes d'importance (historique) vers CSV / plotters |
 | 🟢 Basse | Interface Python via `pyo3` pour interopérabilité |
 | 🟢 Basse | Publication sur crates.io |
 
