@@ -207,7 +207,7 @@ src/
 | ✅ | Importance history CSV export |
 | ✅ | Python bindings (PyO3 + maturin) |
 | 🔲 | `linfa` backend as an alternative to `smartcore` |
-| 🔲 | Publish to crates.io |
+| ✅ | Published on [crates.io](https://crates.io/crates/boruta-rs) |
 
 ---
 
