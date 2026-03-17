@@ -976,7 +976,40 @@ boruta-rs est **2.4× plus rapide que Python** et **6.2× plus rapide que R**.
 
 ---
 
-## 14. Feuille de route
+## 14. Bindings Python
+
+Les bindings sont dans `python/` et utilisent [maturin](https://github.com/PyO3/maturin) comme build backend.
+
+```bash
+cd python
+pip install maturin numpy
+maturin develop --features python   # build en mode développement
+```
+
+```python
+import numpy as np
+from boruta_rs import Boruta
+
+X = np.random.randn(500, 10)
+y = (X[:, :5].sum(axis=1) > 0).astype(np.uint32)
+
+result = Boruta(max_iter=100, p_value=0.01, n_estimators=100, random_seed=42).fit(X, y)
+print(result)            # BorutaResult(confirmed=5, rejected=5, tentative=0, n_iterations=18)
+print(result.confirmed)  # [0, 1, 2, 3, 4]
+
+# TentativeRoughFix (si des features restent Tentative après max_iter)
+result.rough_fix()
+
+# Export CSV de l'historique d'importance
+csv_str = result.importance_history_csv()
+
+# Régression
+result_reg = Boruta(n_estimators=100).fit_regression(X, y_continuous)
+```
+
+---
+
+## 15. Feuille de route
 
 | Priorité | Fonctionnalité |
 |---|---|
@@ -987,9 +1020,9 @@ boruta-rs est **2.4× plus rapide que Python** et **6.2× plus rapide que R**.
 | ✅ Fait | Benchmarks sur datasets réels (Iris, Wine) — voir section 13 |
 | ✅ Fait | `TentativeRoughFix` — `result.tentative_rough_fix()` résout les Tentative résiduels |
 | ✅ Fait | Export CSV de l'historique d'importance — `result.importance_history_to_csv()` |
+| ✅ Fait | Interface Python via `pyo3` — `Boruta().fit(X, y)` depuis Python (voir `python/`) |
+| ✅ Fait | Publication sur crates.io — métadonnées complètes, `cargo publish --dry-run` ✓ |
 | 🟡 Moyenne | Support `linfa` en plus de `smartcore` (feature flag Cargo) |
-| 🟢 Basse | Interface Python via `pyo3` pour interopérabilité |
-| 🟢 Basse | Publication sur crates.io |
 
 ---
 
