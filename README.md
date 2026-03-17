@@ -2,6 +2,8 @@
 
 > Implémentation de l'algorithme Boruta en Rust — sélection de features "all-relevant" basée sur Random Forest.
 
+![bench](https://img.shields.io/badge/benchmark-~1.3s%20(500obs%2C%2016cores)-brightgreen)
+
 ---
 
 ## Table des matières
